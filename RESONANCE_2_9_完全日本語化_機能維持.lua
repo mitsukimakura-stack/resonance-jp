@@ -1068,8 +1068,8 @@ return Japanese
 ]====]
 sources.Spider = [====[
 -- RESONANCE original spider locomotion experiment. NOT copied from XLQP.
--- Own character movement + ladder-shaped joint animation; optional own spawned-toy motion.
--- Does not manipulate other players or their spawned toys.
+-- Real in-game ladders from workspace.Ladders or your spawned toys; no fake ladder geometry in real mode.
+-- Only attempts motion when the client owns the ladder physics. This is a prototype, not XLQP.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -1078,7 +1078,7 @@ local Player = Players.LocalPlayer
 local Spider = {
     Enabled = false, LegCount = 6, Reach = 6, Pace = 7,
     Speed = 18, HoverHeight = 3.4,
-    MoveBody = true, UseRealToys = false,
+    MoveBody = true, UseRealToys = true,
     _folder = nil, _legs = {}, _toys = {}, _toyOriginal = {},
     _connection = nil, _elapsed = 0, _stepTime = 0,
     _root = nil, _humanoid = nil, _motor = nil, _gyro = nil,
@@ -1136,6 +1136,7 @@ end
 
 function Spider:_buildGraphics()
     self:_removeGraphics()
+    if self.UseRealToys then return end -- no substitute parts: real ladders only
     local folder = Instance.new("Folder")
     folder.Name = "Resonance_Spider_Rig"
     folder.Parent = Workspace
@@ -1207,31 +1208,59 @@ local function toyRoot(item)
 end
 
 function Spider:CollectOwnedLadders()
-    -- Real Toy mode can move only YOUR already-spawned ladders when their physics is yours.
     self._toys = {}
     local ownFolder = Player and Workspace:FindFirstChild(Player.Name .. "SpawnedInToys")
-    if not ownFolder then
-        self.Status = "自分の出したおもちゃが見つかりません"
-        return 0
+    local worldFolder = Workspace:FindFirstChild("Ladders")
+    local character = Player and Player.Character
+    local body = character and character:FindFirstChild("HumanoidRootPart")
+    local center = body and body.Position or Vector3.zero
+    local candidates, visited = {}, {}
+    local function isOwned(root)
+        if not self._helpers or not self._helpers.IsNetworkOwner then return false end
+        local ok, owned = pcall(self._helpers.IsNetworkOwner, root)
+        return ok and owned == true
     end
-    local items = ownFolder:GetChildren()
-    for _, item in ipairs(items) do
-        if #self._toys >= self.LegCount then break end
-        if item.Name:lower():find("ladder", 1, true) then
-            local root = toyRoot(item)
-            if root and not root.Anchored then
-                local owned = false
-                if self._helpers and self._helpers.IsNetworkOwner then
-                    local ok, response = pcall(self._helpers.IsNetworkOwner, root)
-                    owned = ok and response == true
-                end
-                if owned then
-                    self._toys[#self._toys + 1] = item
+    local function add(item)
+        if not item or visited[item] then return end
+        visited[item] = true
+        local root = toyRoot(item)
+        if not root or not root.Parent or root.Anchored then return end
+        local distance = (root.Position - center).Magnitude
+        if distance > 120 then return end
+        if not isOwned(root) then return end
+        table.insert(candidates, {toy = item, distance = distance})
+    end
+    -- This game's ordinary ladder collection is workspace.Ladders.
+    -- Its direct children may have names other than 'Ladder'.
+    if worldFolder then
+        for _, item in ipairs(worldFolder:GetChildren()) do
+            if item:IsA("BasePart") or item:IsA("Model") then
+                add(item)
+            elseif item:IsA("Folder") then
+                for _, subItem in ipairs(item:GetChildren()) do
+                    if subItem:IsA("BasePart") or subItem:IsA("Model") then add(subItem) end
                 end
             end
         end
     end
-    self.Status = tostring(#self._toys) .. "本のハシゴを認識（所有中のおもちゃだけ）"
+    if ownFolder then
+        for _, item in ipairs(ownFolder:GetChildren()) do
+            if item.Name:lower():find("ladder", 1, true) then add(item) end
+        end
+    end
+    table.sort(candidates, function(x,y) return x.distance < y.distance end)
+    self._toyOriginal = {}
+    for _, entry in ipairs(candidates) do
+        if #self._toys >= self.LegCount then break end
+        local item = entry.toy
+        table.insert(self._toys, item)
+        local ok, initial = pcall(function() return item:IsA("Model") and item:GetPivot() or item.CFrame end)
+        if ok then self._toyOriginal[item] = initial end
+    end
+    local scanned = tostring(#candidates)
+    local selected = tostring(#self._toys)
+    self.Status = selected .. "本の動かせる本物のハシゴを選択 / 候補" .. scanned .. "本。移動しない場合は物理所有権なし。"
+    warn("RESONANCE 蜘蛛: " .. self.Status)
     return #self._toys
 end
 
@@ -1248,7 +1277,6 @@ end
 
 function Spider:_animateRig(rootCF, moveDir, moving)
     local localMove = rootCF:VectorToObjectSpace(moveDir)
-    local angleOffset = math.atan2(localMove.X, -localMove.Z)
     local helpers = self._helpers
     local ownedCheck
     if helpers and helpers.IsNetworkOwner then
@@ -1257,7 +1285,8 @@ function Spider:_animateRig(rootCF, moveDir, moving)
             return success and result == true
         end
     end
-    for i, leg in ipairs(self._legs) do
+    for i = 1, self.LegCount do
+        local leg = self._legs[i]
         local angle = math.pi * 2 * (i - 1) / self.LegCount
         local dir = Vector3.new(math.sin(angle), 0, -math.cos(angle))
         local phase = self._elapsed + (i % 2) * math.pi
@@ -1269,17 +1298,23 @@ function Spider:_animateRig(rootCF, moveDir, moving)
         local footAim = rootCF:PointToWorldSpace(dir * self.Reach + Vector3.new(0, -self.HoverHeight + lift, 0) + movement)
         local ground = groundAt(footAim, {Player.Character, self._folder})
         local foot = ground and Vector3.new(footAim.X, ground.Position.Y + 0.13 + lift, footAim.Z) or footAim
-        segmentParts(leg.upper, origin, elbow, 0.55)
-        segmentParts(leg.lower, elbow, foot, 0.55)
+        if not self.UseRealToys and leg then
+            segmentParts(leg.upper, origin, elbow, 0.55)
+            segmentParts(leg.lower, elbow, foot, 0.55)
+        end
         if self.UseRealToys and self._toys[i] and self._toys[i].Parent then
-            local midpoint = (elbow + foot) * 0.5
-            moveOwnToy(self._toys[i], CFrame.lookAt(midpoint, foot), ownedCheck)
+            local midpoint = (origin + foot) * 0.5
+            local facing = foot - origin
+            if facing.Magnitude > 0.1 then
+                moveOwnToy(self._toys[i], CFrame.lookAt(midpoint, foot), ownedCheck)
+            end
         end
     end
 end
 
 function Spider:_update(dt)
-    if not self.Enabled or not self._folder or not self._folder.Parent then return end
+    if not self.Enabled then return end
+    if not self.UseRealToys and (not self._folder or not self._folder.Parent) then return end
     local character = Player and Player.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -1343,6 +1378,18 @@ function Spider:SetEnabled(on)
         self._connection = nil
         self:_stopMotor()
         self:_removeGraphics()
+        if self.UseRealToys then
+            for toy, previous in pairs(self._toyOriginal) do
+                local root = toyRoot(toy)
+                if root and root.Parent and self._helpers and self._helpers.IsNetworkOwner then
+                    local ok, owned = pcall(self._helpers.IsNetworkOwner, root)
+                    if ok and owned == true then
+                        pcall(function() moveOwnToy(toy, previous, nil) end)
+                    end
+                end
+            end
+        end
+        self._toyOriginal = {}
         self._toys = {}
         self.Status = "停止中"
     end
@@ -1370,7 +1417,10 @@ function Spider:SetMoveBody(value)
 end
 function Spider:SetUseRealToys(value)
     self.UseRealToys = value == true
-    if self.UseRealToys and self.Enabled then self:CollectOwnedLadders() end
+    if self.Enabled then
+        self:_buildGraphics()
+        if self.UseRealToys then self:CollectOwnedLadders() end
+    end
 end
 function Spider:Destroy()
     self:SetEnabled(false)
@@ -36642,9 +36692,9 @@ Escape Timer: %*]]
 		-- Original spider locomotion experiment, not XLQP source.
 		local spider = requireModule("Spider")
 		spider:SetHelpers(tbl12)
-		local panel = tbl15.Spider:AddLeftGroupbox("蜘蛛モード（歩行試験版）", "bug")
+		local panel = tbl15.Spider:AddLeftGroupbox("蜘蛛モード（本物のハシゴ・試作）", "bug")
 		panel:AddLabel({
-			Text = "動く蜘蛛脚＋浮遊歩行。XLQPの本物のコードではありません。ハシゴ操作は自分の所有物だけが対象です。",
+			Text = "ゲーム内に元からある本物のハシゴを脚にする実験版です。物理制御できるハシゴだけが動きます。XLQPそのものではありません。",
 			DoesWrap = true,
 		})
 		panel:AddToggle("SpiderVisualEnabled", {
@@ -36658,13 +36708,13 @@ Escape Timer: %*]]
 			Callback = function(value) spider:SetMoveBody(value) end,
 		})
 		panel:AddToggle("SpiderToyLadders", {
-			Text = "自分のハシゴも動かす（実験）",
-			Default = false,
-			Tooltip = "自分が出した物で、物理所有権のあるLadderのみ動かします。存在しない場合は効果なし。",
+			Text = "本物のハシゴを脚にする",
+			Default = true,
+			Tooltip = "ゲーム内のLaddersと自分のスポーンしたハシゴを探します。物理所有権がある場合だけ移動します。",
 			Callback = function(value) spider:SetUseRealToys(value) end,
 		})
 		panel:AddButton({
-			Text = "自分のハシゴを再検索",
+			Text = "ゲーム内のハシゴを探す",
 			Func = function()
 				local n = spider:CollectOwnedLadders()
 				warn("Resonance 蜘蛛: " .. spider.Status)

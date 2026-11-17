@@ -1066,6 +1066,172 @@ end
 
 return Japanese
 ]====]
+sources.Spider = [====[
+-- RESONANCE spider preview: independent cosmetic add-on.
+-- Client-side white ladder-shaped legs. Does NOT manipulate live toys or other players.
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
+
+local Spider = {
+    Enabled = false,
+    LegCount = 6,
+    Reach = 5,
+    Pace = 6,
+    _folder = nil,
+    _legs = {},
+    _connection = nil,
+    _elapsed = 0,
+    _stepTime = 0,
+}
+
+local function newPart(parent, label)
+    local p = Instance.new("Part")
+    p.Name = label
+    p.Anchored = true
+    p.CanCollide = false
+    p.CanTouch = false
+    p.CanQuery = false
+    p.CastShadow = false
+    p.Material = Enum.Material.SmoothPlastic
+    p.Color = Color3.fromRGB(236, 235, 226)
+    p.Transparency = 0.03
+    p.Size = Vector3.new(0.14, 0.14, 1)
+    p.Parent = parent
+    return p
+end
+
+local function createLadder(parent, label)
+    local ladder = {
+        left = newPart(parent, label .. "_LeftRail"),
+        right = newPart(parent, label .. "_RightRail"),
+        rungs = {},
+    }
+    for i = 1, 4 do
+        ladder.rungs[i] = newPart(parent, label .. "_Rung" .. i)
+    end
+    return ladder
+end
+
+local function drawLadder(ladder, pointA, pointB, width)
+    local diff = pointB - pointA
+    local length = diff.Magnitude
+    if length < 0.15 then return end
+    local center = (pointA + pointB) * 0.5
+    local rotation = CFrame.lookAt(center, pointB)
+    local axis = diff.Unit
+    local sideways = axis:Cross(Vector3.new(0, 1, 0))
+    if sideways.Magnitude < 0.05 then
+        sideways = axis:Cross(Vector3.new(1, 0, 0))
+    end
+    sideways = sideways.Unit * (width * 0.5)
+    ladder.left.Size = Vector3.new(0.13, 0.15, length)
+    ladder.right.Size = Vector3.new(0.13, 0.15, length)
+    ladder.left.CFrame = rotation + sideways
+    ladder.right.CFrame = rotation - sideways
+    for i, rung in ipairs(ladder.rungs) do
+        local t = i / (#ladder.rungs + 1)
+        local position = pointA:Lerp(pointB, t)
+        rung.Size = Vector3.new(width, 0.13, 0.13)
+        -- Local x-axis is the rung direction; the frame faces down the ladder.
+        rung.CFrame = CFrame.lookAt(position, pointB)
+    end
+end
+
+function Spider:_clearRig()
+    if self._folder then
+        self._folder:Destroy()
+        self._folder = nil
+    end
+    self._legs = {}
+end
+
+function Spider:_buildRig()
+    self:_clearRig()
+    local folder = Instance.new("Folder")
+    folder.Name = "Resonance_Spider_VisualOnly"
+    folder.Parent = workspace
+    self._folder = folder
+    for i = 1, self.LegCount do
+        self._legs[i] = {
+            upper = createLadder(folder, "Leg" .. i .. "_Upper"),
+            lower = createLadder(folder, "Leg" .. i .. "_Lower"),
+        }
+    end
+end
+
+function Spider:_update(dt)
+    if not self.Enabled or not self._folder or not self._folder.Parent then return end
+    self._stepTime = self._stepTime + dt
+    if self._stepTime < 1 / 24 then return end
+    self._stepTime = 0
+    local character = Player and Player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then return end
+
+    local move = humanoid.MoveDirection
+    local moving = math.clamp(move.Magnitude, 0, 1)
+    self._elapsed = self._elapsed + dt * self.Pace * (moving > 0.03 and 1 or 0.15)
+    local rootCF = root.CFrame
+    local relativeMove = rootCF:VectorToObjectSpace(move)
+    local reach = self.Reach
+    local count = self.LegCount
+    for i, leg in ipairs(self._legs) do
+        local angle = math.pi * 2 * (i - 1) / count
+        local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+        local phase = self._elapsed + (i % 2) * math.pi
+        local swing = math.cos(phase) * moving * 0.75
+        local lift = math.max(math.sin(phase), 0) * moving * 0.85
+        local toward = Vector3.new(relativeMove.X, 0, relativeMove.Z) * swing
+        local hip = Vector3.new(direction.X * 0.9, 0.25, direction.Z * 0.9)
+        local knee = direction * (reach * 0.67) + Vector3.new(0, 0.95, 0) + toward * 0.35
+        local foot = direction * reach + Vector3.new(0, -2.7 + lift, 0) + toward
+        drawLadder(leg.upper, rootCF:PointToWorldSpace(hip), rootCF:PointToWorldSpace(knee), 0.44)
+        drawLadder(leg.lower, rootCF:PointToWorldSpace(knee), rootCF:PointToWorldSpace(foot), 0.44)
+    end
+end
+
+function Spider:SetEnabled(value)
+    local enabled = not not value
+    if enabled == self.Enabled then return end
+    self.Enabled = enabled
+    if enabled then
+        self._elapsed = 0
+        self._stepTime = 0
+        self:_buildRig()
+        self._connection = RunService.Heartbeat:Connect(function(dt)
+            local ok, message = pcall(self._update, self, dt)
+            if not ok then warn("Resonance Spider: " .. tostring(message)) end
+        end)
+    else
+        if self._connection then
+            self._connection:Disconnect()
+            self._connection = nil
+        end
+        self:_clearRig()
+    end
+end
+
+function Spider:SetLegCount(value)
+    self.LegCount = math.clamp(math.floor(tonumber(value) or 6), 4, 8)
+    if self.Enabled then self:_buildRig() end
+end
+
+function Spider:SetReach(value)
+    self.Reach = math.clamp(tonumber(value) or 5, 2, 9)
+end
+
+function Spider:SetPace(value)
+    self.Pace = math.clamp(tonumber(value) or 6, 1, 14)
+end
+
+function Spider:Destroy()
+    self:SetEnabled(false)
+end
+
+return Spider
+]====]
 sources.Intro = [====[
 local Intro = {}
 
@@ -36317,6 +36483,7 @@ Escape Timer: %*]]
 			Target = v19:AddTab("<b>Target</b>", "crosshair", "Single/multiple target actions"),
 			Blobman = v19:AddTab("<b>Blobman</b>", "venetian-mask", "Single/multiple Blobman target actions"),
 			Toys = v19:AddTab("<b>Toys</b>", "shapes", "Actions you can do with Toys"),
+			Spider = v19:AddTab("<b>蜘蛛モード</b>", "bug", "はしご型の蜘蛛脚（画面表示のみ）"),
 			Visual = v19:AddTab("<b>Visual</b>", "eye", "Stuff only you can see"),
 			AutoClicker = v19:AddTab("<b>Auto-Clicker</b>", "mouse-pointer-click", "Make figures out of players"),
 			Keybinds = v19:AddTab("<b>Keybinds</b>", "keyboard", "Keybinds you can press for specific action"),
@@ -36324,6 +36491,66 @@ Escape Timer: %*]]
 			Lists = v19:AddTab("<b>Lists</b>", "scroll-text", "Miscellaneous useful dropdowns"),
 			Settings = v19:AddTab("<b>Settings</b>", "settings", "GUI Settings"),
 		}
+
+
+	do
+		-- Added as a separate tab. Existing Resonance options and behavior remain unchanged.
+		local spider = requireModule("Spider")
+		local panel = tbl15.Spider:AddLeftGroupbox("蜘蛛モード（試作）", "bug")
+		panel:AddLabel({
+			Text = "白いはしご型の脚が歩く動きに合わせて動きます。自分の画面だけに表示される見た目の機能です。",
+			DoesWrap = true,
+		})
+		panel:AddToggle("SpiderVisualEnabled", {
+			Text = "蜘蛛の脚を表示",
+			Default = false,
+			Tooltip = "蜘蛛の脚を表示・非表示。実物のToy操作はしません。",
+			Callback = function(value)
+				spider:SetEnabled(value)
+			end,
+		})
+		panel:AddSlider("SpiderVisualLegCount", {
+			Text = "脚の本数",
+			Default = 6,
+			Min = 4,
+			Max = 8,
+			Rounding = 0,
+			Callback = function(value)
+				spider:SetLegCount(value)
+			end,
+		})
+		panel:AddSlider("SpiderVisualReach", {
+			Text = "脚の長さ",
+			Default = 5,
+			Min = 2,
+			Max = 9,
+			Rounding = 1,
+			Callback = function(value)
+				spider:SetReach(value)
+			end,
+		})
+		panel:AddSlider("SpiderVisualPace", {
+			Text = "歩行アニメーション速度",
+			Default = 6,
+			Min = 1,
+			Max = 14,
+			Rounding = 1,
+			Callback = function(value)
+				spider:SetPace(value)
+			end,
+		})
+		panel:AddButton({
+			Text = "蜘蛛モードを解除",
+			Func = function()
+				if toggles.SpiderVisualEnabled then
+					toggles.SpiderVisualEnabled:SetValue(false)
+				else
+					spider:SetEnabled(false)
+				end
+			end,
+		})
+		lib:OnUnload(function() spider:Destroy() end)
+	end
 
 	do
 		local Greetings = tbl15.Home:AddLeftGroupbox("Greetings", "chess-queen")
@@ -44641,7 +44868,7 @@ local ok, result = xpcall(function()
     if type(writefile) == "function" and type(readfile) == "function" then
         local success = pcall(function()
             local lines = {"local sources = {}"}
-            for _, name in ipairs({"Intro", "Library", "ThemeManager", "SaveManager", "Icons", "Main", "Bootstrap", "Notices", "Japanese"}) do
+            for _, name in ipairs({"Intro", "Library", "ThemeManager", "SaveManager", "Icons", "Main", "Bootstrap", "Notices", "Japanese", "Spider"}) do
                 lines[#lines + 1] = string.format("sources[%q] = %q", name, sources[name])
             end
             lines[#lines + 1] = 'local run, message = loadstring(sources.Bootstrap, "@Resonance/Bootstrap"); assert(run, message); return run(sources)'

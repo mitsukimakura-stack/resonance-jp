@@ -1067,169 +1067,314 @@ end
 return Japanese
 ]====]
 sources.Spider = [====[
--- RESONANCE spider preview: independent cosmetic add-on.
--- Client-side white ladder-shaped legs. Does NOT manipulate live toys or other players.
+-- RESONANCE original spider locomotion experiment. NOT copied from XLQP.
+-- Own character movement + ladder-shaped joint animation; optional own spawned-toy motion.
+-- Does not manipulate other players or their spawned toys.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 local Player = Players.LocalPlayer
 
 local Spider = {
-    Enabled = false,
-    LegCount = 6,
-    Reach = 5,
-    Pace = 6,
-    _folder = nil,
-    _legs = {},
-    _connection = nil,
-    _elapsed = 0,
-    _stepTime = 0,
+    Enabled = false, LegCount = 6, Reach = 6, Pace = 7,
+    Speed = 18, HoverHeight = 3.4,
+    MoveBody = true, UseRealToys = false,
+    _folder = nil, _legs = {}, _toys = {}, _toyOriginal = {},
+    _connection = nil, _elapsed = 0, _stepTime = 0,
+    _root = nil, _humanoid = nil, _motor = nil, _gyro = nil,
+    _oldSpeed = nil, _oldAutoRotate = nil, _helpers = nil,
+    Status = "未開始", _desired = nil,
 }
 
-local function newPart(parent, label)
-    local p = Instance.new("Part")
-    p.Name = label
-    p.Anchored = true
-    p.CanCollide = false
-    p.CanTouch = false
-    p.CanQuery = false
-    p.CastShadow = false
-    p.Material = Enum.Material.SmoothPlastic
-    p.Color = Color3.fromRGB(236, 235, 226)
-    p.Transparency = 0.03
-    p.Size = Vector3.new(0.14, 0.14, 1)
-    p.Parent = parent
-    return p
+local function newPart(parent, name)
+    local part = Instance.new("Part")
+    part.Name = name
+    part.Size = Vector3.new(0.12, 0.12, 1)
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.CastShadow = false
+    part.Material = Enum.Material.SmoothPlastic
+    part.Color = Color3.fromRGB(245, 245, 240)
+    part.Parent = parent
+    return part
 end
 
-local function createLadder(parent, label)
-    local ladder = {
-        left = newPart(parent, label .. "_LeftRail"),
-        right = newPart(parent, label .. "_RightRail"),
-        rungs = {},
+local function makeSection(parent, name)
+    local section = {
+        rails = {newPart(parent, name .. "_R1"), newPart(parent, name .. "_R2")},
+        steps = {},
     }
-    for i = 1, 4 do
-        ladder.rungs[i] = newPart(parent, label .. "_Rung" .. i)
+    for j = 1, 5 do
+        section.steps[j] = newPart(parent, name .. "_Step" .. j)
     end
-    return ladder
+    return section
 end
 
-local function drawLadder(ladder, pointA, pointB, width)
-    local diff = pointB - pointA
-    local length = diff.Magnitude
-    if length < 0.15 then return end
-    local center = (pointA + pointB) * 0.5
-    local rotation = CFrame.lookAt(center, pointB)
-    local axis = diff.Unit
-    local sideways = axis:Cross(Vector3.new(0, 1, 0))
-    if sideways.Magnitude < 0.05 then
-        sideways = axis:Cross(Vector3.new(1, 0, 0))
+local function segmentParts(section, a, b, width)
+    local vec = b - a
+    local length = vec.Magnitude
+    if length <= 0.1 then return end
+    local center = (a + b) * 0.5
+    local frame = CFrame.lookAt(center, b)
+    local side = frame.RightVector * (width * 0.5)
+    for k, rail in ipairs(section.rails) do
+        rail.Size = Vector3.new(0.14, 0.15, length)
+        rail.CFrame = frame + side * (k == 1 and -1 or 1)
     end
-    sideways = sideways.Unit * (width * 0.5)
-    ladder.left.Size = Vector3.new(0.13, 0.15, length)
-    ladder.right.Size = Vector3.new(0.13, 0.15, length)
-    ladder.left.CFrame = rotation + sideways
-    ladder.right.CFrame = rotation - sideways
-    for i, rung in ipairs(ladder.rungs) do
-        local t = i / (#ladder.rungs + 1)
-        local position = pointA:Lerp(pointB, t)
-        rung.Size = Vector3.new(width, 0.13, 0.13)
-        -- Local x-axis is the rung direction; the frame faces down the ladder.
-        rung.CFrame = CFrame.lookAt(position, pointB)
+    for index, step in ipairs(section.steps) do
+        step.Size = Vector3.new(width, 0.12, 0.12)
+        step.CFrame = CFrame.lookAt(a:Lerp(b, index / (#section.steps + 1)), b)
     end
 end
 
-function Spider:_clearRig()
-    if self._folder then
-        self._folder:Destroy()
-        self._folder = nil
-    end
-    self._legs = {}
+function Spider:_removeGraphics()
+    if self._folder then self._folder:Destroy() end
+    self._folder, self._legs = nil, {}
 end
 
-function Spider:_buildRig()
-    self:_clearRig()
+function Spider:_buildGraphics()
+    self:_removeGraphics()
     local folder = Instance.new("Folder")
-    folder.Name = "Resonance_Spider_VisualOnly"
-    folder.Parent = workspace
+    folder.Name = "Resonance_Spider_Rig"
+    folder.Parent = Workspace
     self._folder = folder
     for i = 1, self.LegCount do
         self._legs[i] = {
-            upper = createLadder(folder, "Leg" .. i .. "_Upper"),
-            lower = createLadder(folder, "Leg" .. i .. "_Lower"),
+            upper = makeSection(folder, "Leg" .. i .. "Upper"),
+            lower = makeSection(folder, "Leg" .. i .. "Lower"),
         }
+    end
+end
+
+function Spider:_stopMotor()
+    if self._motor then self._motor:Destroy() end
+    if self._gyro then self._gyro:Destroy() end
+    self._motor, self._gyro = nil, nil
+    if self._humanoid and self._humanoid.Parent then
+        if self._oldSpeed then self._humanoid.WalkSpeed = self._oldSpeed end
+        if self._oldAutoRotate ~= nil then self._humanoid.AutoRotate = self._oldAutoRotate end
+    end
+    self._humanoid, self._root = nil, nil
+    self._oldSpeed, self._oldAutoRotate = nil, nil
+    self._desired = nil
+end
+
+function Spider:_setupMotor()
+    local character = Player and Player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not self.MoveBody or not root or not humanoid or humanoid.Health <= 0 then return end
+    if root == self._root and self._motor and self._motor.Parent then return end
+    self:_stopMotor()
+    self._root, self._humanoid = root, humanoid
+    self._desired = root.Position
+    self._oldSpeed = humanoid.WalkSpeed
+    self._oldAutoRotate = humanoid.AutoRotate
+    humanoid.WalkSpeed = 0
+    humanoid.AutoRotate = false
+    local position = Instance.new("BodyPosition")
+    position.Name = "ResonanceSpiderPosition"
+    position.P = 9000
+    position.D = 1550
+    position.MaxForce = Vector3.new(2e6, 2e6, 2e6)
+    position.Position = root.Position
+    position.Parent = root
+    local gyro = Instance.new("BodyGyro")
+    gyro.Name = "ResonanceSpiderRotation"
+    gyro.P = 6000
+    gyro.D = 600
+    gyro.MaxTorque = Vector3.new(0, 5e6, 0)
+    gyro.CFrame = root.CFrame
+    gyro.Parent = root
+    self._motor, self._gyro = position, gyro
+end
+
+local function groundAt(position, ignored)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignored
+    params.IgnoreWater = true
+    return Workspace:Raycast(position + Vector3.new(0, 8, 0), Vector3.new(0, -40, 0), params)
+end
+
+local function toyRoot(item)
+    if item:IsA("BasePart") then return item end
+    if item:IsA("Model") then
+        return item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart", true)
+    end
+end
+
+function Spider:CollectOwnedLadders()
+    -- Real Toy mode can move only YOUR already-spawned ladders when their physics is yours.
+    self._toys = {}
+    local ownFolder = Player and Workspace:FindFirstChild(Player.Name .. "SpawnedInToys")
+    if not ownFolder then
+        self.Status = "自分の出したおもちゃが見つかりません"
+        return 0
+    end
+    local items = ownFolder:GetChildren()
+    for _, item in ipairs(items) do
+        if #self._toys >= self.LegCount then break end
+        if item.Name:lower():find("ladder", 1, true) then
+            local root = toyRoot(item)
+            if root and not root.Anchored then
+                local owned = false
+                if self._helpers and self._helpers.IsNetworkOwner then
+                    local ok, response = pcall(self._helpers.IsNetworkOwner, root)
+                    owned = ok and response == true
+                end
+                if owned then
+                    self._toys[#self._toys + 1] = item
+                end
+            end
+        end
+    end
+    self.Status = tostring(#self._toys) .. "本のハシゴを認識（所有中のおもちゃだけ）"
+    return #self._toys
+end
+
+local function moveOwnToy(item, target, ownerCheck)
+    local root = toyRoot(item)
+    if not root or not root.Parent or root.Anchored then return end
+    if ownerCheck and not ownerCheck(root) then return end
+    if item:IsA("Model") then
+        item:PivotTo(target)
+    elseif item:IsA("BasePart") then
+        item.CFrame = target
+    end
+end
+
+function Spider:_animateRig(rootCF, moveDir, moving)
+    local localMove = rootCF:VectorToObjectSpace(moveDir)
+    local angleOffset = math.atan2(localMove.X, -localMove.Z)
+    local helpers = self._helpers
+    local ownedCheck
+    if helpers and helpers.IsNetworkOwner then
+        ownedCheck = function(rootPart)
+            local success, result = pcall(helpers.IsNetworkOwner, rootPart)
+            return success and result == true
+        end
+    end
+    for i, leg in ipairs(self._legs) do
+        local angle = math.pi * 2 * (i - 1) / self.LegCount
+        local dir = Vector3.new(math.sin(angle), 0, -math.cos(angle))
+        local phase = self._elapsed + (i % 2) * math.pi
+        local swing = math.cos(phase) * moving * 0.85
+        local lift = math.max(0, math.sin(phase)) * moving * 1.1
+        local movement = Vector3.new(localMove.X, 0, localMove.Z) * swing
+        local origin = rootCF:PointToWorldSpace(dir * 0.7 + Vector3.new(0, -0.25, 0))
+        local elbow = rootCF:PointToWorldSpace(dir * self.Reach * 0.66 + Vector3.new(0, 0.65, 0) + movement * 0.4)
+        local footAim = rootCF:PointToWorldSpace(dir * self.Reach + Vector3.new(0, -self.HoverHeight + lift, 0) + movement)
+        local ground = groundAt(footAim, {Player.Character, self._folder})
+        local foot = ground and Vector3.new(footAim.X, ground.Position.Y + 0.13 + lift, footAim.Z) or footAim
+        segmentParts(leg.upper, origin, elbow, 0.55)
+        segmentParts(leg.lower, elbow, foot, 0.55)
+        if self.UseRealToys and self._toys[i] and self._toys[i].Parent then
+            local midpoint = (elbow + foot) * 0.5
+            moveOwnToy(self._toys[i], CFrame.lookAt(midpoint, foot), ownedCheck)
+        end
     end
 end
 
 function Spider:_update(dt)
     if not self.Enabled or not self._folder or not self._folder.Parent then return end
-    self._stepTime = self._stepTime + dt
-    if self._stepTime < 1 / 24 then return end
-    self._stepTime = 0
     local character = Player and Player.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if not root or not humanoid or humanoid.Health <= 0 then return end
-
-    local move = humanoid.MoveDirection
-    local moving = math.clamp(move.Magnitude, 0, 1)
-    self._elapsed = self._elapsed + dt * self.Pace * (moving > 0.03 and 1 or 0.15)
-    local rootCF = root.CFrame
-    local relativeMove = rootCF:VectorToObjectSpace(move)
-    local reach = self.Reach
-    local count = self.LegCount
-    for i, leg in ipairs(self._legs) do
-        local angle = math.pi * 2 * (i - 1) / count
-        local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
-        local phase = self._elapsed + (i % 2) * math.pi
-        local swing = math.cos(phase) * moving * 0.75
-        local lift = math.max(math.sin(phase), 0) * moving * 0.85
-        local toward = Vector3.new(relativeMove.X, 0, relativeMove.Z) * swing
-        local hip = Vector3.new(direction.X * 0.9, 0.25, direction.Z * 0.9)
-        local knee = direction * (reach * 0.67) + Vector3.new(0, 0.95, 0) + toward * 0.35
-        local foot = direction * reach + Vector3.new(0, -2.7 + lift, 0) + toward
-        drawLadder(leg.upper, rootCF:PointToWorldSpace(hip), rootCF:PointToWorldSpace(knee), 0.44)
-        drawLadder(leg.lower, rootCF:PointToWorldSpace(knee), rootCF:PointToWorldSpace(foot), 0.44)
+    if self.MoveBody then
+        self:_setupMotor()
+        if self._motor and self._motor.Parent then
+            local input = humanoid.MoveDirection
+            local dir = Vector3.new(input.X, 0, input.Z)
+            if dir.Magnitude > 1 then dir = dir.Unit end
+            self._desired = (self._desired or root.Position) + dir * self.Speed * math.min(dt, 0.06)
+            if (self._desired - root.Position).Magnitude > 12 then
+                self._desired = root.Position + dir * 7
+            end
+            local target = self._desired
+            local hit = groundAt(target, {character, self._folder})
+            local targetY = hit and hit.Position.Y + self.HoverHeight or root.Position.Y
+            local forwardHit = nil
+            if dir.Magnitude > 0.1 then
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {character, self._folder}
+                forwardHit = Workspace:Raycast(root.Position, dir * 3, params)
+            end
+            if forwardHit and forwardHit.Normal.Y < 0.4 then
+                targetY = math.max(targetY, root.Position.Y + self.Speed * 0.45 * dt)
+            end
+            self._motor.Position = Vector3.new(target.X, targetY, target.Z)
+            if dir.Magnitude > 0.1 then
+                self._gyro.CFrame = CFrame.lookAt(root.Position, root.Position + dir)
+            end
+        end
+    elseif self._motor then
+        self:_stopMotor()
     end
+    self._elapsed = self._elapsed + dt * self.Pace * (humanoid.MoveDirection.Magnitude > 0.08 and 1 or 0.08)
+    self._stepTime += dt
+    if self._stepTime < 1 / 30 then return end
+    self._stepTime = 0
+    self:_animateRig(root.CFrame, humanoid.MoveDirection, math.clamp(humanoid.MoveDirection.Magnitude, 0, 1))
 end
 
-function Spider:SetEnabled(value)
-    local enabled = not not value
-    if enabled == self.Enabled then return end
+function Spider:SetEnabled(on)
+    local enabled = on == true
+    if self.Enabled == enabled then return end
     self.Enabled = enabled
     if enabled then
-        self._elapsed = 0
-        self._stepTime = 0
-        self:_buildRig()
+        self._elapsed, self._stepTime = 0, 0
+        self:_buildGraphics()
+        if self.UseRealToys then self:CollectOwnedLadders() end
         self._connection = RunService.Heartbeat:Connect(function(dt)
-            local ok, message = pcall(self._update, self, dt)
-            if not ok then warn("Resonance Spider: " .. tostring(message)) end
+            local ok, msg = pcall(self._update, self, dt)
+            if not ok then
+                self.Status = "エラー: " .. tostring(msg)
+                warn("Resonance Spider: " .. tostring(msg))
+            end
         end)
+        self.Status = "蜘蛛モード稼働中（独自実装・試験版）"
     else
-        if self._connection then
-            self._connection:Disconnect()
-            self._connection = nil
-        end
-        self:_clearRig()
+        if self._connection then self._connection:Disconnect() end
+        self._connection = nil
+        self:_stopMotor()
+        self:_removeGraphics()
+        self._toys = {}
+        self.Status = "停止中"
     end
 end
 
+function Spider:SetHelpers(tableOfHelpers)
+    self._helpers = tableOfHelpers
+end
 function Spider:SetLegCount(value)
     self.LegCount = math.clamp(math.floor(tonumber(value) or 6), 4, 8)
-    if self.Enabled then self:_buildRig() end
+    if self.Enabled then self:_buildGraphics() end
 end
-
 function Spider:SetReach(value)
-    self.Reach = math.clamp(tonumber(value) or 5, 2, 9)
+    self.Reach = math.clamp(tonumber(value) or 6, 3, 10)
 end
-
 function Spider:SetPace(value)
-    self.Pace = math.clamp(tonumber(value) or 6, 1, 14)
+    self.Pace = math.clamp(tonumber(value) or 7, 1, 14)
 end
-
+function Spider:SetSpeed(value)
+    self.Speed = math.clamp(tonumber(value) or 18, 6, 35)
+end
+function Spider:SetMoveBody(value)
+    self.MoveBody = value == true
+    if not self.MoveBody then self:_stopMotor() end
+end
+function Spider:SetUseRealToys(value)
+    self.UseRealToys = value == true
+    if self.UseRealToys and self.Enabled then self:CollectOwnedLadders() end
+end
 function Spider:Destroy()
     self:SetEnabled(false)
 end
-
 return Spider
 ]====]
 sources.Intro = [====[
@@ -36483,7 +36628,7 @@ Escape Timer: %*]]
 			Target = v19:AddTab("<b>Target</b>", "crosshair", "Single/multiple target actions"),
 			Blobman = v19:AddTab("<b>Blobman</b>", "venetian-mask", "Single/multiple Blobman target actions"),
 			Toys = v19:AddTab("<b>Toys</b>", "shapes", "Actions you can do with Toys"),
-			Spider = v19:AddTab("<b>蜘蛛モード</b>", "bug", "はしご型の蜘蛛脚（画面表示のみ）"),
+			Spider = v19:AddTab("<b>蜘蛛モード</b>", "bug", "脚の動きと移動（独自実験版）"),
 			Visual = v19:AddTab("<b>Visual</b>", "eye", "Stuff only you can see"),
 			AutoClicker = v19:AddTab("<b>Auto-Clicker</b>", "mouse-pointer-click", "Make figures out of players"),
 			Keybinds = v19:AddTab("<b>Keybinds</b>", "keyboard", "Keybinds you can press for specific action"),
@@ -36494,50 +36639,52 @@ Escape Timer: %*]]
 
 
 	do
-		-- Added as a separate tab. Existing Resonance options and behavior remain unchanged.
+		-- Original spider locomotion experiment, not XLQP source.
 		local spider = requireModule("Spider")
-		local panel = tbl15.Spider:AddLeftGroupbox("蜘蛛モード（試作）", "bug")
+		spider:SetHelpers(tbl12)
+		local panel = tbl15.Spider:AddLeftGroupbox("蜘蛛モード（歩行試験版）", "bug")
 		panel:AddLabel({
-			Text = "白いはしご型の脚が歩く動きに合わせて動きます。自分の画面だけに表示される見た目の機能です。",
+			Text = "動く蜘蛛脚＋浮遊歩行。XLQPの本物のコードではありません。ハシゴ操作は自分の所有物だけが対象です。",
 			DoesWrap = true,
 		})
 		panel:AddToggle("SpiderVisualEnabled", {
-			Text = "蜘蛛の脚を表示",
+			Text = "蜘蛛モードを有効化",
 			Default = false,
-			Tooltip = "蜘蛛の脚を表示・非表示。実物のToy操作はしません。",
-			Callback = function(value)
-				spider:SetEnabled(value)
+			Callback = function(value) spider:SetEnabled(value) end,
+		})
+		panel:AddToggle("SpiderMoveBody", {
+			Text = "蜘蛛として移動（浮遊・段差のぼり）",
+			Default = true,
+			Callback = function(value) spider:SetMoveBody(value) end,
+		})
+		panel:AddToggle("SpiderToyLadders", {
+			Text = "自分のハシゴも動かす（実験）",
+			Default = false,
+			Tooltip = "自分が出した物で、物理所有権のあるLadderのみ動かします。存在しない場合は効果なし。",
+			Callback = function(value) spider:SetUseRealToys(value) end,
+		})
+		panel:AddButton({
+			Text = "自分のハシゴを再検索",
+			Func = function()
+				local n = spider:CollectOwnedLadders()
+				warn("Resonance 蜘蛛: " .. spider.Status)
 			end,
 		})
 		panel:AddSlider("SpiderVisualLegCount", {
-			Text = "脚の本数",
-			Default = 6,
-			Min = 4,
-			Max = 8,
-			Rounding = 0,
-			Callback = function(value)
-				spider:SetLegCount(value)
-			end,
+			Text = "脚の本数", Default = 6, Min = 4, Max = 8, Rounding = 0,
+			Callback = function(value) spider:SetLegCount(value) end,
 		})
 		panel:AddSlider("SpiderVisualReach", {
-			Text = "脚の長さ",
-			Default = 5,
-			Min = 2,
-			Max = 9,
-			Rounding = 1,
-			Callback = function(value)
-				spider:SetReach(value)
-			end,
+			Text = "脚の長さ", Default = 6, Min = 3, Max = 10, Rounding = 1,
+			Callback = function(value) spider:SetReach(value) end,
 		})
 		panel:AddSlider("SpiderVisualPace", {
-			Text = "歩行アニメーション速度",
-			Default = 6,
-			Min = 1,
-			Max = 14,
-			Rounding = 1,
-			Callback = function(value)
-				spider:SetPace(value)
-			end,
+			Text = "脚の動きの速度", Default = 7, Min = 1, Max = 14, Rounding = 1,
+			Callback = function(value) spider:SetPace(value) end,
+		})
+		panel:AddSlider("SpiderTravelSpeed", {
+			Text = "蜘蛛の移動速度", Default = 18, Min = 6, Max = 35, Rounding = 1,
+			Callback = function(value) spider:SetSpeed(value) end,
 		})
 		panel:AddButton({
 			Text = "蜘蛛モードを解除",
